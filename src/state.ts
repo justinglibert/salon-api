@@ -167,10 +167,58 @@ export class State {
             s.rooms[0].instruction = 'WUBALUBADUBDUB'
         })
     }
+    async startOneOnOneRoutine(salonId: string){
+        // What we do is we assign a score to each rank for everybody. So if I rank you one, your score is N wher N is the number of people in my rank.
+        // Sum the rank of all combinations (so N^2) and we rerank that.
+        // We then go from the top and create rooms based on the common rank. If someone is already in a room, we skip that row
+        // Repeat that thing T times where you put a massive penalty on people that have already been together in the rank. You can then reuse the same algorithm
+    }
+    calculateMatches(salonId: string, roomsPreviouslyCreated : {man : Participant, woman: Participant}[]){
+        const commonRanks : {man : Participant, woman : Participant, score : number}[] = []
+        if(this.salons[salonId].participants.filter(p => p.gender === Gender.MALE).length !== this.salons[salonId].participants.filter(p => p.gender === Gender.FEMALE).length){
+            throw new Error("Gender imbalance. Can't match")
+        }
+        // We want to iterate over every different gender combination without repetition
+        for(const man of this.salons[salonId].participants.filter(p => p.gender === Gender.MALE)){
+            for(const woman of this.salons[salonId].participants.filter(p => p.gender === Gender.FEMALE)){
+                const manScore = man.ranking.length - man.ranking.findIndex(r => r === woman.uid)
+                const womanScore = woman.ranking.length - woman.ranking.findIndex(r => r === man.uid)
+                if(roomsPreviouslyCreated.find(r => r.man.uid === man.uid && r.woman.uid === woman.uid)){
+                    // Make the new room impossible because it already happened
+                    commonRanks.push({man: man, woman, score: -100})
+                } else {
+                    commonRanks.push({man, woman, score: manScore + womanScore})
+                }
+            }
+        }
+        // Now we sort common ranks in ascending order
+        commonRanks.sort((a, b) => {
+            if(a.score < b.score){
+                return -1
+            } else {
+                return 1
+            }
+        })
+        const rooms : {man : Participant, woman: Participant}[] = []
+        while(rooms.length < this.salons[salonId].participants.filter(p => p.gender === Gender.MALE).length){
+            if(commonRanks.length === 0){
+                throw new Error("common ranks is empty")
+            } else {
+                const proposal = commonRanks.pop() as {man : Participant, woman : Participant, score : number}
+                if(!rooms.find(r => r.man.uid === proposal?.man.uid || r.woman.uid === proposal?.woman.uid)){
+                    rooms.push({
+                        man: proposal.man,
+                        woman: proposal.woman
+                    })
+                }
+            }
+        }
+        return rooms
+    }
     // =========================================
     async rpc(salonId: string, userId: string, action: string, payload: any) {
         switch (action) {
-            case 'NEXT_STEP':
+            case 'NEXT_STATE':
                 this.addInterupt(salonId, Interrupt.NEXT_STATE)
                 break;
             case 'UPDATE_RANKING':
