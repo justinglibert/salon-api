@@ -42,13 +42,22 @@ interface Room {
     instruction: string // Normal text next to action
     timer?: number // Epoch of the timer. If undefined -> no timer
     activeSpeaker?: string // uid of the active speaker
+    nextPartOfSequenceButtonText?: string // The label of the button. Can be "End speaker turn" or "Next question" or whatever. it goes to the next part of the game. If undefined there is no button!
+}
+enum Interrupt {
+    NEXT_STATE = "NEXT_STATE"
+}
+interface Interrupts {
+    [key : string] : Interrupt[] // key is the salon id
 }
 export class State {
     private salons: {
         [key: string]: Salon
     }
+    private interrupts: Interrupts
     constructor() {
         this.salons = {}
+        this.interrupts = {}
     }
     createSalonWithJoinId(joinId: string) {
         this.salons[joinId] = {
@@ -58,6 +67,7 @@ export class State {
             participants: [],
             rooms: []
         }
+        this.interrupts[joinId] = []
         return joinId
     }
     createSalon() {
@@ -69,6 +79,7 @@ export class State {
             participants: [],
             rooms: []
         }
+        this.interrupts[joinId] = []
         return joinId
     }
     getSalons() {
@@ -129,14 +140,28 @@ export class State {
             throw new Error("Could not delete this DailyCo room")
         }
     }
+    sleepOrInterrupt(ms : number, salonId : string, interrupt : Interrupt){
+        return new Promise(async (res, rej) => {
+            setTimeout(res, ms)
+            const numberOfInterruptsOfInterest = this.interrupts[salonId].filter(i => i === interrupt).length
+            while(true){
+                await sleep(100)
+                if(this.interrupts[salonId].filter(i => i === interrupt).length > numberOfInterruptsOfInterest){
+                    res()
+                }
+            }
+        })
+    }
     // ========== Interactive Part =============
     async startGroupRoutine(salonId: string) {
-        await sleep(5000)
+        // I need a sleep or next step function I can await...
+        // Can use interrupts? CPU Development style.
+        await this.sleepOrInterrupt(60000, salonId, Interrupt.NEXT_STATE)
         await this.changeState(salonId, s => {
             s.rooms[0].action = 'Now dance'
             s.rooms[0].instruction = 'If you lack inspiration, do the Orange Justice'
         })
-        await sleep(5000)
+        await this.sleepOrInterrupt(60000, salonId, Interrupt.NEXT_STATE)
         await this.changeState(salonId, s => {
             s.rooms[0].action = 'Now dance harder!'
             s.rooms[0].instruction = 'WUBALUBADUBDUB'
@@ -145,8 +170,8 @@ export class State {
     // =========================================
     async rpc(salonId: string, userId: string, action: string, payload: any) {
         switch (action) {
-            case 'END_SPEAKING_TURN':
-
+            case 'NEXT_STEP':
+                this.addInterupt(salonId, Interrupt.NEXT_STATE)
                 break;
             case 'UPDATE_RANKING':
                 this.changeState(salonId, s => {
@@ -158,6 +183,13 @@ export class State {
                 break;
             default:
                 throw new Error("This RPC action does not exist");
+        }
+    }
+    private addInterupt(salonId: string, interrupt: Interrupt){
+        if (salonId in this.interrupts){
+            this.interrupts[salonId].push(interrupt)
+        } else {
+            this.interrupts[salonId] = [interrupt]
         }
     }
     async addParticipant(salonId: string, gender: Gender, name: string, twitterHandle: string): Promise<{ channelId: string, yourId: string, currentState: Salon }> {
@@ -177,10 +209,13 @@ export class State {
                 uid,
             })
             // Add the new participant to people ranking
+            // Love functional programming
             s.participants = [...s.participants.filter(s => s.gender !== gender).map(s => ({
                 ...s,
                 ranking: [...s.ranking, uid]
             })), ...s.participants.filter(s => s.gender === gender)]
+            // Start the salon if enough people join
+            // TODO: Check for gender balance
             if (s.participants.length === 4) {
                 const roomName = salonId + '-group'
                 await this.createDailyRoom(roomName)
