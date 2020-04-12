@@ -19,6 +19,8 @@ enum Gender {
     FEMALE = "FEMALE"
 }
 
+const NUMBER_OF_PEOPLE_OF_SAME_GENDER = 3
+
 export interface Participant {
     uid: string,
     gender: Gender,
@@ -27,6 +29,7 @@ export interface Participant {
     profilePicture: string, // URL
     ranking: string[] // List of ids. Index 0 is the most preferrable
     likes: string[] // Id of People they liked during one on ones
+    mutualMatches: Participant[],
     currentRoomId?: string // If this is not undefined, user is in that daily.co room. Otherwise not in a room
 }
 interface Salon {
@@ -220,9 +223,20 @@ export class State {
             await this.sleepOrInterrupt(60 * 1000, salonId, salonId + '-group', Interrupt.CANT_INTERRUPT)
             for (const r of rooms) {
                 const roomName = r.man.uid + '-' + r.woman.uid
-                // await this.deleteDailyRoom(roomName)
+                await this.deleteDailyRoom(roomName)
             }
         }
+        this.changeState(salonId, s => {
+            s.state = 'END'
+            for (const man of s.participants.filter(p => p.gender === Gender.MALE)) {
+                for (const woman of s.participants.filter(p => p.gender === Gender.FEMALE)) {
+                    if(woman.likes.includes(man.uid) && man.likes.includes(woman.uid)){
+                        s.participants.find(p => p.uid === man.uid)?.mutualMatches.push(woman)
+                        s.participants.find(p => p.uid === woman.uid)?.mutualMatches.push(man)
+                    }
+                }
+            }
+        })
     }
     calculateMatches(salonId: string, roomsPreviouslyCreated: { man: Participant, woman: Participant }[]) {
         const commonRanks: { man: Participant, woman: Participant, score: number }[] = []
@@ -280,6 +294,14 @@ export class State {
                     }
                 })
                 break;
+            case 'LIKE':
+                this.changeState(salonId, s => {
+                    const p = s.participants.find(s => s.uid === userId)
+                    if (p) {
+                        p.likes.push(payload)
+                    }
+                })
+                break;
             default:
                 throw new Error("This RPC action does not exist");
         }
@@ -301,6 +323,10 @@ export class State {
         if (this.salons[salonId].state !== "WAITING_ROOM") {
             throw new Error("This salon has started and it is not possible to join anymore")
         }
+        if(this.salons[salonId].participants.filter(s => s.gender === gender).length >= NUMBER_OF_PEOPLE_OF_SAME_GENDER){
+            throw new Error("There are too many " + (gender === Gender.MALE ? 'men' : 'women') + ' in this Salon')
+        }
+
         const uid = Math.random().toString(36).slice(-6);
         await this.changeState(salonId, async (s) => {
             s.participants.push({
@@ -310,6 +336,7 @@ export class State {
                 profilePicture: `https://twivatar.glitch.me/${twitterHandle}`,
                 ranking: s.participants.filter(s => s.gender !== gender).map(s => s.uid),
                 twitterHandle,
+                mutualMatches: [],
                 uid,
             })
             // Add the new participant to people ranking
@@ -319,9 +346,7 @@ export class State {
                 ranking: [...s.ranking, uid]
             })), ...s.participants.filter(s => s.gender === gender)]
             // Start the salon if enough people join
-            // TODO: Check for gender balance
-            //TODO: FIXXX
-            if (s.participants.length === 2) {
+            if (s.participants.length === NUMBER_OF_PEOPLE_OF_SAME_GENDER * 2) {
                 const roomName = salonId + '-group'
                 await this.createDailyRoom(roomName)
                 s.state = 'GROUP'
