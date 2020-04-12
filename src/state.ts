@@ -1,4 +1,4 @@
-import { makeId } from './handy'
+import { makeId, sleep } from './handy'
 import { v4 as uuidv4 } from 'uuid';
 import Pusher from 'pusher';
 import fetch from 'node-fetch';
@@ -34,6 +34,14 @@ interface Salon {
     pusherChannel: string,
     state: 'WAITING_ROOM' | "GROUP" | "ONE_ON_ONE" | "END"
     participants: Participant[]
+    rooms: Room[]
+}
+interface Room {
+    id: string // Same as current roomId in the Participant interface
+    action: string // Bold text
+    instruction: string // Normal text next to action
+    timer?: number // Epoch of the timer. If undefined -> no timer
+    activeSpeaker?: string // uid of the active speaker
 }
 export class State {
     private salons: {
@@ -47,7 +55,8 @@ export class State {
             joinId,
             pusherChannel: joinId,
             state: 'WAITING_ROOM',
-            participants: []
+            participants: [],
+            rooms: []
         }
         return joinId
     }
@@ -57,7 +66,8 @@ export class State {
             joinId,
             pusherChannel: joinId,
             state: 'WAITING_ROOM',
-            participants: []
+            participants: [],
+            rooms: []
         }
         return joinId
     }
@@ -98,7 +108,7 @@ export class State {
         }
         const res = await fetch(url, { method: 'GET', headers: headers })
         const j = await res.json()
-        for(const r of j.data){
+        for (const r of j.data) {
             await this.deleteDailyRoom(r.name)
         }
     }
@@ -119,6 +129,37 @@ export class State {
             throw new Error("Could not delete this DailyCo room")
         }
     }
+    // ========== Interactive Part =============
+    async startGroupRoutine(salonId: string) {
+        await sleep(5000)
+        await this.changeState(salonId, s => {
+            s.rooms[0].action = 'Now dance'
+            s.rooms[0].instruction = 'If you lack inspiration, do the Orange Justice'
+        })
+        await sleep(5000)
+        await this.changeState(salonId, s => {
+            s.rooms[0].action = 'Now dance harder!'
+            s.rooms[0].instruction = 'WUBALUBADUBDUB'
+        })
+    }
+    // =========================================
+    async rpc(salonId: string, userId: string, action: string, payload: any) {
+        switch (action) {
+            case 'END_SPEAKING_TURN':
+
+                break;
+            case 'UPDATE_RANKING':
+                this.changeState(salonId, s => {
+                    const p = s.participants.find(s => s.uid === userId)
+                    if (p) {
+                        p.ranking = payload
+                    }
+                })
+                break;
+            default:
+                throw new Error("This RPC action does not exist");
+        }
+    }
     async addParticipant(salonId: string, gender: Gender, name: string, twitterHandle: string): Promise<{ channelId: string, yourId: string, currentState: Salon }> {
         this.ensureSalonId(salonId)
         if (this.salons[salonId].state !== "WAITING_ROOM") {
@@ -130,11 +171,16 @@ export class State {
                 likes: [],
                 name,
                 gender,
-                profilePicture: "https://randomuser.me/api/portraits/men/75.jpg",
-                ranking: [],
+                profilePicture: `https://twivatar.glitch.me/${twitterHandle}`,
+                ranking: s.participants.filter(s => s.gender !== gender).map(s => s.uid),
                 twitterHandle,
                 uid,
             })
+            // Add the new participant to people ranking
+            s.participants = [...s.participants.filter(s => s.gender !== gender).map(s => ({
+                ...s,
+                ranking: [...s.ranking, uid]
+            })), ...s.participants.filter(s => s.gender === gender)]
             if (s.participants.length === 4) {
                 const roomName = salonId + '-group'
                 await this.createDailyRoom(roomName)
@@ -143,6 +189,15 @@ export class State {
                     ...s,
                     currentRoomId: roomName
                 }))
+                const now = new Date()
+                const msSinceEpoch = now.getTime()
+                s.rooms.push({
+                    action: 'Introduction',
+                    instruction: 'Please introduce yourself',
+                    id: roomName,
+                    timer: msSinceEpoch + 30 * 1000 // 30 Seconds
+                })
+                this.startGroupRoutine(salonId)
             }
         })
         return {

@@ -31,6 +31,20 @@ app.post('/join', async (req, res) => {
     }
 })
 
+app.post('/rpc', async (req, res) => {
+    console.log("RPC: ", req.body)
+    try {
+    const {salonId, userId, action, payload} = req.body
+    await s.rpc(salonId, userId, action, payload)
+    res.sendStatus(200)
+    } catch(e) {
+        console.error(e)
+        res.status(400).json({
+            error: e.toString()
+        })
+    }
+})
+
 app.post('/createSalon', (req, res) => {
     console.log("Salon creation initiated")
     try {
