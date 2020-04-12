@@ -1,4 +1,4 @@
-import { makeId, sleep } from './handy'
+import { makeId, sleep, getMsSinceEpoch, createRoomIdFromRoomObject } from './handy'
 import { v4 as uuidv4 } from 'uuid';
 import Pusher from 'pusher';
 import fetch from 'node-fetch';
@@ -19,7 +19,7 @@ enum Gender {
     FEMALE = "FEMALE"
 }
 
-interface Participant {
+export interface Participant {
     uid: string,
     gender: Gender,
     name: string,
@@ -40,15 +40,19 @@ interface Room {
     id: string // Same as current roomId in the Participant interface
     action: string // Bold text
     instruction: string // Normal text next to action
+    popup?: string // If this is not undefined, a popup with the instructions of the current game will be shown on the client as well as the timer
     timer?: number // Epoch of the timer. If undefined -> no timer
     activeSpeaker?: string // uid of the active speaker
     nextPartOfSequenceButtonText?: string // The label of the button. Can be "End speaker turn" or "Next question" or whatever. it goes to the next part of the game. If undefined there is no button!
 }
 enum Interrupt {
-    NEXT_STATE = "NEXT_STATE"
+    NEXT_STATE = "NEXT_STATE",
+    CANT_INTERRUPT = "CANT_INTERRUPT"
 }
 interface Interrupts {
-    [key : string] : Interrupt[] // key is the salon id
+    [key: string]: {
+        [key: string]: Interrupt[] // key is the salon id
+    }
 }
 export class State {
     private salons: {
@@ -67,7 +71,7 @@ export class State {
             participants: [],
             rooms: []
         }
-        this.interrupts[joinId] = []
+        this.interrupts[joinId] = {}
         return joinId
     }
     createSalon() {
@@ -79,7 +83,7 @@ export class State {
             participants: [],
             rooms: []
         }
-        this.interrupts[joinId] = []
+        this.interrupts[joinId] = {}
         return joinId
     }
     getSalons() {
@@ -140,13 +144,13 @@ export class State {
             throw new Error("Could not delete this DailyCo room")
         }
     }
-    sleepOrInterrupt(ms : number, salonId : string, interrupt : Interrupt){
+    sleepOrInterrupt(ms: number, salonId: string, roomId: string, interrupt: Interrupt) {
         return new Promise(async (res, rej) => {
             setTimeout(res, ms)
-            const numberOfInterruptsOfInterest = this.interrupts[salonId].filter(i => i === interrupt).length
-            while(true){
+            const numberOfInterruptsOfInterest = this.interrupts[salonId][roomId].filter(i => i === interrupt).length
+            while (true) {
                 await sleep(100)
-                if(this.interrupts[salonId].filter(i => i === interrupt).length > numberOfInterruptsOfInterest){
+                if (this.interrupts[salonId][roomId].filter(i => i === interrupt).length > numberOfInterruptsOfInterest) {
                     res()
                 }
             }
@@ -154,58 +158,105 @@ export class State {
     }
     // ========== Interactive Part =============
     async startGroupRoutine(salonId: string) {
-        // I need a sleep or next step function I can await...
-        // Can use interrupts? CPU Development style.
-        await this.sleepOrInterrupt(60000, salonId, Interrupt.NEXT_STATE)
+        await this.sleepOrInterrupt(8 * 1000, salonId, salonId + '-group', Interrupt.CANT_INTERRUPT)
+        for (const p of this.salons[salonId].participants) {
+            await this.changeState(salonId, s => {
+                s.rooms[0].action = p.name + ' is going to introduce ' + (p.gender === Gender.MALE ? 'himself' : 'herself')
+                s.rooms[0].instruction = p.name + ': Speak for 30 seconds!'
+                s.rooms[0].timer = getMsSinceEpoch() + 30 * 1000
+                s.rooms[0].nextPartOfSequenceButtonText = 'End speaking turn'
+                s.rooms[0].activeSpeaker = p.uid
+                s.rooms[0].popup = undefined
+            })
+            await this.sleepOrInterrupt(30 * 1000, salonId, salonId + '-group', Interrupt.NEXT_STATE)
+        }
         await this.changeState(salonId, s => {
-            s.rooms[0].action = 'Now dance'
-            s.rooms[0].instruction = 'If you lack inspiration, do the Orange Justice'
+            s.rooms[0].action = 'Lock in your ranking!'
+            s.rooms[0].instruction = 'We will move to one on ones in 10 seconds'
+            s.rooms[0].timer = getMsSinceEpoch() + 10 * 1000
+            s.rooms[0].activeSpeaker = undefined
+            s.rooms[0].nextPartOfSequenceButtonText = undefined
         })
-        await this.sleepOrInterrupt(60000, salonId, Interrupt.NEXT_STATE)
+        await this.sleepOrInterrupt(10 * 1000, salonId, salonId + '-group', Interrupt.CANT_INTERRUPT)
         await this.changeState(salonId, s => {
-            s.rooms[0].action = 'Now dance harder!'
-            s.rooms[0].instruction = 'WUBALUBADUBDUB'
+            s.rooms[0].action = 'Get ready and read the instructions'
+            s.rooms[0].instruction = ''
+            s.rooms[0].timer = getMsSinceEpoch() + 8 * 1000
+            s.rooms[0].activeSpeaker = undefined
+            s.rooms[0].nextPartOfSequenceButtonText = undefined
+            s.rooms[0].popup = 'Get ready for one on ones! You will soon be moved to individual rooms based on your ranking.'
         })
+        await this.sleepOrInterrupt(8 * 1000, salonId, salonId + '-group', Interrupt.CANT_INTERRUPT)
+        this.startOneOnOneRoutine(salonId)
+
     }
-    async startOneOnOneRoutine(salonId: string){
+    async startOneOnOneRoutine(salonId: string) {
         // What we do is we assign a score to each rank for everybody. So if I rank you one, your score is N wher N is the number of people in my rank.
         // Sum the rank of all combinations (so N^2) and we rerank that.
         // We then go from the top and create rooms based on the common rank. If someone is already in a room, we skip that row
         // Repeat that thing T times where you put a massive penalty on people that have already been together in the rank. You can then reuse the same algorithm
+        const oneOnOneRooms: { man: Participant, woman: Participant }[] = []
+        for (const i of [1, 2]) {
+            const rooms = this.calculateMatches(salonId, oneOnOneRooms)
+            oneOnOneRooms.push(...rooms)
+            for (const r of rooms) {
+                const roomName = r.man.uid + '-' + r.woman.uid
+                await this.createDailyRoom(roomName)
+                this.addInteruptRoom(salonId, roomName)
+            }
+            // Will use promise.all when multiple promises in each room
+            await this.changeState(salonId, s => {
+                s.rooms = rooms.map(r => ({
+                    action: `${r.man.name} and ${r.woman.name}: Talk together 💘`,
+                    instruction: '',
+                    id: createRoomIdFromRoomObject(r),
+                    timer: getMsSinceEpoch() + 60 * 1000 // 60 Seconds
+                }))
+                s.participants = s.participants.map(p => ({
+                    ...p,
+                    currentRoomId: createRoomIdFromRoomObject(rooms.find(r => r.man.uid === p.uid || r.woman.uid === p.uid) as { man: Participant, woman: Participant })
+                }))
+            })
+            await this.sleepOrInterrupt(60 * 1000, salonId, salonId + '-group', Interrupt.CANT_INTERRUPT)
+            for (const r of rooms) {
+                const roomName = r.man.uid + '-' + r.woman.uid
+                // await this.deleteDailyRoom(roomName)
+            }
+        }
     }
-    calculateMatches(salonId: string, roomsPreviouslyCreated : {man : Participant, woman: Participant}[]){
-        const commonRanks : {man : Participant, woman : Participant, score : number}[] = []
-        if(this.salons[salonId].participants.filter(p => p.gender === Gender.MALE).length !== this.salons[salonId].participants.filter(p => p.gender === Gender.FEMALE).length){
+    calculateMatches(salonId: string, roomsPreviouslyCreated: { man: Participant, woman: Participant }[]) {
+        const commonRanks: { man: Participant, woman: Participant, score: number }[] = []
+        if (this.salons[salonId].participants.filter(p => p.gender === Gender.MALE).length !== this.salons[salonId].participants.filter(p => p.gender === Gender.FEMALE).length) {
             throw new Error("Gender imbalance. Can't match")
         }
         // We want to iterate over every different gender combination without repetition
-        for(const man of this.salons[salonId].participants.filter(p => p.gender === Gender.MALE)){
-            for(const woman of this.salons[salonId].participants.filter(p => p.gender === Gender.FEMALE)){
+        for (const man of this.salons[salonId].participants.filter(p => p.gender === Gender.MALE)) {
+            for (const woman of this.salons[salonId].participants.filter(p => p.gender === Gender.FEMALE)) {
                 const manScore = man.ranking.length - man.ranking.findIndex(r => r === woman.uid)
                 const womanScore = woman.ranking.length - woman.ranking.findIndex(r => r === man.uid)
-                if(roomsPreviouslyCreated.find(r => r.man.uid === man.uid && r.woman.uid === woman.uid)){
+                if (roomsPreviouslyCreated.find(r => r.man.uid === man.uid && r.woman.uid === woman.uid)) {
                     // Make the new room impossible because it already happened
-                    commonRanks.push({man: man, woman, score: -100})
+                    commonRanks.push({ man: man, woman, score: -100 })
                 } else {
-                    commonRanks.push({man, woman, score: manScore + womanScore})
+                    commonRanks.push({ man, woman, score: manScore + womanScore })
                 }
             }
         }
         // Now we sort common ranks in ascending order
         commonRanks.sort((a, b) => {
-            if(a.score < b.score){
+            if (a.score < b.score) {
                 return -1
             } else {
                 return 1
             }
         })
-        const rooms : {man : Participant, woman: Participant}[] = []
-        while(rooms.length < this.salons[salonId].participants.filter(p => p.gender === Gender.MALE).length){
-            if(commonRanks.length === 0){
+        const rooms: { man: Participant, woman: Participant }[] = []
+        while (rooms.length < this.salons[salonId].participants.filter(p => p.gender === Gender.MALE).length) {
+            if (commonRanks.length === 0) {
                 throw new Error("common ranks is empty")
             } else {
-                const proposal = commonRanks.pop() as {man : Participant, woman : Participant, score : number}
-                if(!rooms.find(r => r.man.uid === proposal?.man.uid || r.woman.uid === proposal?.woman.uid)){
+                const proposal = commonRanks.pop() as { man: Participant, woman: Participant, score: number }
+                if (!rooms.find(r => r.man.uid === proposal?.man.uid || r.woman.uid === proposal?.woman.uid)) {
                     rooms.push({
                         man: proposal.man,
                         woman: proposal.woman
@@ -219,7 +270,7 @@ export class State {
     async rpc(salonId: string, userId: string, action: string, payload: any) {
         switch (action) {
             case 'NEXT_STATE':
-                this.addInterupt(salonId, Interrupt.NEXT_STATE)
+                this.addInterupt(salonId, payload, Interrupt.NEXT_STATE)
                 break;
             case 'UPDATE_RANKING':
                 this.changeState(salonId, s => {
@@ -233,11 +284,16 @@ export class State {
                 throw new Error("This RPC action does not exist");
         }
     }
-    private addInterupt(salonId: string, interrupt: Interrupt){
-        if (salonId in this.interrupts){
-            this.interrupts[salonId].push(interrupt)
+    private addInterupt(salonId: string, roomId: string, interrupt: Interrupt) {
+        if (roomId in this.interrupts[salonId]) {
+            this.interrupts[salonId][roomId].push(interrupt)
         } else {
-            this.interrupts[salonId] = [interrupt]
+            this.interrupts[salonId][roomId] = []
+        }
+    }
+    private addInteruptRoom(salonId: string, roomId: string){
+        if(!(roomId in this.interrupts[salonId])){
+            this.interrupts[salonId][roomId] = []
         }
     }
     async addParticipant(salonId: string, gender: Gender, name: string, twitterHandle: string): Promise<{ channelId: string, yourId: string, currentState: Salon }> {
@@ -245,7 +301,7 @@ export class State {
         if (this.salons[salonId].state !== "WAITING_ROOM") {
             throw new Error("This salon has started and it is not possible to join anymore")
         }
-        const uid = uuidv4()
+        const uid = Math.random().toString(36).slice(-6);
         await this.changeState(salonId, async (s) => {
             s.participants.push({
                 likes: [],
@@ -264,7 +320,8 @@ export class State {
             })), ...s.participants.filter(s => s.gender === gender)]
             // Start the salon if enough people join
             // TODO: Check for gender balance
-            if (s.participants.length === 4) {
+            //TODO: FIXXX
+            if (s.participants.length === 2) {
                 const roomName = salonId + '-group'
                 await this.createDailyRoom(roomName)
                 s.state = 'GROUP'
@@ -272,14 +329,16 @@ export class State {
                     ...s,
                     currentRoomId: roomName
                 }))
-                const now = new Date()
-                const msSinceEpoch = now.getTime()
+                this.addInteruptRoom(salonId, roomName)
+
                 s.rooms.push({
-                    action: 'Introduction',
-                    instruction: 'Please introduce yourself',
+                    action: 'Read the instructions!',
+                    instruction: '',
+                    popup: 'Welcome to Salon! You just joined the group video call. You now have a few minutes to introduce yourself 😄. Every participant will get 30 seconds of time. Please don\'t interrupt each other!. When it is your turn to speak, you can also end it early by pressing a button in the top right corner.',
                     id: roomName,
-                    timer: msSinceEpoch + 30 * 1000 // 30 Seconds
+                    timer: getMsSinceEpoch() + 8 * 1000 // 15 Seconds
                 })
+                console.log('start group routine')
                 this.startGroupRoutine(salonId)
             }
         })

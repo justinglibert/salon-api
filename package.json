@@ -33,6 +33,7 @@
     "node-fetch": "^2.6.0",
     "pusher": "^3.0.1",
     "ts-node-dev": "^1.0.0-pre.44",
+    "use-sound": "^1.0.1",
     "uuid": "^7.0.3"
   }
 }

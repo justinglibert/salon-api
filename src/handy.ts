@@ -1,3 +1,4 @@
+import {Participant} from './state'
 export function makeId(length : number) {
     var result           = '';
     var characters       = '123456789';
@@ -13,3 +14,12 @@ export function sleep(ms : number) {
      setTimeout(resolve, ms);
    });
  } 
+
+ export function getMsSinceEpoch() {
+   const now = new Date()
+   const msSinceEpoch = now.getTime()
+   return msSinceEpoch
+ }
+ export function createRoomIdFromRoomObject(r : {man : Participant, woman: Participant}) {
+   return r.man.uid + '-' + r.woman.uid
+ }
